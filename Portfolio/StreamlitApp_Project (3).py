@@ -141,7 +141,7 @@ def display_explanation(input_df, session, aws_bucket):
 
     best_pipeline          = load_pipeline(session, aws_bucket, 'sklearn-pipeline-deployment')
     preprocessing_pipeline = Pipeline(steps=best_pipeline.steps[:-2])
-    input_df               = pd.DataFrame(input_df)
+    input_df = pd.DataFrame([input_df])
     input_df_transformed   = preprocessing_pipeline.transform(input_df)
 
     # Use features_to_keep from our custom FeatureSelector (no get_support() needed)
