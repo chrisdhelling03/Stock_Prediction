@@ -1,216 +1,332 @@
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import PowerTransformer
+from sklearn.preprocessing import PowerTransformer, LabelEncoder
 from scipy.stats import skew
 
-class AutoPowerTransformer(BaseEstimator, TransformerMixin):
-    def __init__(self, threshold=0.75):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Drop columns with too many missing values
+# ─────────────────────────────────────────────────────────────────────────────
+class DropHighMissingCols(BaseEstimator, TransformerMixin):
+    """
+    Drops columns whose missing-value ratio exceeds `threshold`.
+    Fits (learns which columns to keep) on training data and applies
+    the same column list to test data.
+    """
+    def __init__(self, threshold=0.30):
         self.threshold = threshold
-        self.skewed_cols = []
-        self.pt = PowerTransformer(method='yeo-johnson')
+        self.cols_to_keep_ = []
 
     def fit(self, X, y=None):
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
-        
-        # PROTECTION: Only look at columns that are actually numeric
-        # This prevents the step from ever seeing a categorical string
+        null_ratios = X.isnull().mean()
+        self.cols_to_keep_ = null_ratios[null_ratios <= self.threshold].index.tolist()
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        # Only keep columns that exist in the current frame
+        keep = [c for c in self.cols_to_keep_ if c in X.columns]
+        return X[keep]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Transaction-specific feature engineering
+# ─────────────────────────────────────────────────────────────────────────────
+class TransactionFeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Creates fraud-domain-relevant features:
+      • Time decomposition from TransactionDT (seconds since epoch)
+      • Log-transform of TransactionAmt
+      • Frequency-encoding of high-cardinality categoricals
+      • Interaction features  (card1 × addr1, email domain match flag)
+      • Aggregation features  (mean/std of TransactionAmt per card1)
+    All frequency maps are learned in fit() so test data receives the
+    same encodings, with unseen categories mapped to the global mean.
+    """
+    def __init__(self):
+        self.freq_maps_ = {}
+        self.agg_maps_  = {}
+        self.global_mean_amt_ = None
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    @staticmethod
+    def _safe_freq_encode(series, freq_map, fill_value):
+        return series.map(freq_map).fillna(fill_value)
+
+    # ── fit ──────────────────────────────────────────────────────────────────
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+
+        # Frequency-encode these columns
+        freq_cols = ['card4', 'card6', 'ProductCD', 'P_emaildomain', 'R_emaildomain']
+        for col in freq_cols:
+            if col in X.columns:
+                counts = X[col].value_counts(normalize=True)
+                self.freq_maps_[col] = counts.to_dict()
+
+        # Aggregations over card1
+        if 'card1' in X.columns and 'TransactionAmt' in X.columns:
+            grp = X.groupby('card1')['TransactionAmt']
+            self.agg_maps_['card1_amt_mean'] = grp.mean().to_dict()
+            self.agg_maps_['card1_amt_std']  = grp.std().fillna(0).to_dict()
+
+        if 'TransactionAmt' in X.columns:
+            self.global_mean_amt_ = X['TransactionAmt'].mean()
+
+        return self
+
+    # ── transform ─────────────────────────────────────────────────────────────
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        X = X.copy()
+
+        # ── Time features ────────────────────────────────────────────────────
+        if 'TransactionDT' in X.columns:
+            START_DATE = pd.Timestamp('2017-12-01')
+            X['TransactionDT_hour']    = (X['TransactionDT'] // 3600) % 24
+            X['TransactionDT_dayofwk'] = (X['TransactionDT'] // 86400) % 7
+            X['TransactionDT_day']     = X['TransactionDT'] // 86400
+
+        # ── Log amount ───────────────────────────────────────────────────────
+        if 'TransactionAmt' in X.columns:
+            X['TransactionAmt_log'] = np.log1p(X['TransactionAmt'])
+
+        # ── Frequency encoding ───────────────────────────────────────────────
+        for col, fmap in self.freq_maps_.items():
+            if col in X.columns:
+                fill = np.mean(list(fmap.values()))
+                X[f'{col}_freq_enc'] = self._safe_freq_encode(X[col], fmap, fill)
+
+        # ── Interaction: card1 × addr1 ───────────────────────────────────────
+        if 'card1' in X.columns and 'addr1' in X.columns:
+            X['card1_addr1'] = X['card1'].astype(str) + '_' + \
+                               X['addr1'].fillna(-1).astype(int).astype(str)
+            # Frequency-encode the interaction as well
+            if 'card1_addr1' in self.freq_maps_:
+                fill = np.mean(list(self.freq_maps_['card1_addr1'].values()))
+                X['card1_addr1_freq'] = self._safe_freq_encode(
+                    X['card1_addr1'], self.freq_maps_['card1_addr1'], fill)
+            else:
+                X['card1_addr1_freq'] = 0.0
+            X.drop(columns=['card1_addr1'], inplace=True, errors='ignore')
+
+        # ── Email-domain match flag ──────────────────────────────────────────
+        if 'P_emaildomain' in X.columns and 'R_emaildomain' in X.columns:
+            X['email_match'] = (X['P_emaildomain'] == X['R_emaildomain']).astype(int)
+
+        # ── Aggregation features: card1 × TransactionAmt ────────────────────
+        if 'card1' in X.columns and self.agg_maps_:
+            fill_mean = self.global_mean_amt_ if self.global_mean_amt_ else 0
+            X['card1_amt_mean'] = X['card1'].map(
+                self.agg_maps_.get('card1_amt_mean', {})).fillna(fill_mean)
+            X['card1_amt_std']  = X['card1'].map(
+                self.agg_maps_.get('card1_amt_std', {})).fillna(0)
+            # Ratio: how unusual is this transaction for this card?
+            X['amt_to_card_mean_ratio'] = (
+                X['TransactionAmt'] / (X['card1_amt_mean'] + 1e-6)
+            )
+
+        return X
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Drop highly correlated features (redundancy removal)
+# ─────────────────────────────────────────────────────────────────────────────
+class DropHighCorrelation(BaseEstimator, TransformerMixin):
+    """
+    Removes numeric features that are pairwise-correlated above `threshold`.
+    For each correlated pair the feature with the lower mean absolute
+    correlation to *all* other features is retained (keeps the more
+    'central' feature).
+    """
+    def __init__(self, threshold=0.95):
+        self.threshold = threshold
+        self.cols_to_drop_ = []
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        num = X.select_dtypes(include=[np.number])
+        corr_matrix = num.corr().abs()
+
+        upper = corr_matrix.where(
+            np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+        self.cols_to_drop_ = [
+            col for col in upper.columns if any(upper[col] > self.threshold)]
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        return X.drop(columns=self.cols_to_drop_, errors='ignore')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Categorical encoder (label-encode + fill unknown)
+# ─────────────────────────────────────────────────────────────────────────────
+class SafeLabelEncoder(BaseEstimator, TransformerMixin):
+    """
+    Label-encodes all object/string columns. Unseen categories at
+    transform time are mapped to -1 so pipelines don't break on test data.
+    Boolean M-columns ('T'/'F') are also handled gracefully.
+    """
+    def __init__(self):
+        self.encoders_ = {}
+        self.cat_cols_  = []
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        self.cat_cols_ = X.select_dtypes(include=['object']).columns.tolist()
+        for col in self.cat_cols_:
+            le = LabelEncoder()
+            le.fit(X[col].fillna('missing').astype(str))
+            self.encoders_[col] = le
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        X = X.copy()
+        for col in self.cat_cols_:
+            if col not in X.columns:
+                continue
+            le = self.encoders_[col]
+            known = set(le.classes_)
+            X[col] = X[col].fillna('missing').astype(str).apply(
+                lambda v: v if v in known else 'missing')
+            # Ensure 'missing' is in the encoder; add it dynamically if needed
+            if 'missing' not in known:
+                le.classes_ = np.append(le.classes_, 'missing')
+            X[col] = le.transform(X[col])
+        return X
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Numeric imputer (median fill)
+# ─────────────────────────────────────────────────────────────────────────────
+class MedianImputer(BaseEstimator, TransformerMixin):
+    """
+    Fills missing numeric values with per-column medians learned on
+    training data.
+    """
+    def __init__(self):
+        self.medians_ = {}
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        num_cols = X.select_dtypes(include=[np.number]).columns
+        self.medians_ = X[num_cols].median().to_dict()
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        X = X.copy()
+        for col, val in self.medians_.items():
+            if col in X.columns:
+                X[col] = X[col].fillna(val)
+        return X
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. AutoPowerTransformer (retained from original, adapted for fraud data)
+# ─────────────────────────────────────────────────────────────────────────────
+class AutoPowerTransformer(BaseEstimator, TransformerMixin):
+    """
+    Applies Yeo-Johnson power transformation to numeric columns whose
+    absolute skewness exceeds `threshold`.  Categorical columns are
+    never touched.
+    """
+    def __init__(self, threshold=0.75):
+        self.threshold   = threshold
+        self.skewed_cols = []
+        self.pt          = PowerTransformer(method='yeo-johnson')
+
+    def fit(self, X, y=None):
+        import warnings
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
         numeric_df = X.select_dtypes(include=[np.number])
-        
         if numeric_df.empty:
             return self
-
-        # Only calculate skewness for numeric columns
-        skewness = numeric_df.apply(lambda x: skew(x.dropna()))
+        # Cast to float64 to prevent overflow/precision warnings on reduced dtypes
+        numeric_df = numeric_df.astype(np.float64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            skewness = numeric_df.apply(lambda x: skew(x.dropna()))
         self.skewed_cols = skewness[abs(skewness) > self.threshold].index.tolist()
-        
         if self.skewed_cols:
-            self.pt.fit(X[self.skewed_cols])
+            self.pt.fit(X[self.skewed_cols].astype(np.float64))
         return self
 
     def transform(self, X):
-        X_copy = X.copy()
-        if not isinstance(X_copy, pd.DataFrame):
-            X_copy = pd.DataFrame(X_copy)
-            
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        X = X.copy()
         if self.skewed_cols:
-            X_copy[self.skewed_cols] = self.pt.transform(X_copy[self.skewed_cols])
-        return X_copy
+            X[self.skewed_cols] = self.pt.transform(
+                X[self.skewed_cols].astype(np.float64))
+        return X
 
 
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. FeatureSelector (retained & adapted)
+# ─────────────────────────────────────────────────────────────────────────────
 class FeatureSelector(BaseEstimator, TransformerMixin):
-    def __init__(self, missing_threshold=0.3, corr_threshold=0.03, cardinality_threshold=0.9):
-        self.missing_threshold = missing_threshold
-        self.corr_threshold = corr_threshold
-        self.cardinality_threshold = cardinality_threshold # Ratio of unique values to total rows
-        self.features_to_keep = []
+    """
+    Three-stage filter:
+      1. Drop columns with > missing_threshold fraction of nulls.
+      2. Drop categorical columns with cardinality > cardinality_threshold.
+      3. Drop numeric columns with |correlation to target| < corr_threshold.
+    """
+    def __init__(self, missing_threshold=0.3,
+                 corr_threshold=0.03,
+                 cardinality_threshold=0.9):
+        self.missing_threshold     = missing_threshold
+        self.corr_threshold        = corr_threshold
+        self.cardinality_threshold = cardinality_threshold
+        self.features_to_keep      = []
 
     def fit(self, X, y=None):
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
-        
-        # 1. Missing Values Filter
-        null_ratios = X.isnull().mean()
-        cols_low_missing = null_ratios[null_ratios <= self.missing_threshold].index.tolist()
-        X_filtered = X[cols_low_missing]
 
-        # 2. High Cardinality Filter (Only for Categorical/Object columns)
-        cat_cols = X_filtered.select_dtypes(exclude='number').columns
-        cols_to_drop = []
-        
-        for col in cat_cols:
-            uniqueness_ratio = X_filtered[col].nunique() / len(X_filtered)
-            if uniqueness_ratio > self.cardinality_threshold:
-                cols_to_drop.append(col)
-        
-        # Keep categoricals that are NOT high cardinality
-        remaining_cats = [c for c in cat_cols if c not in cols_to_drop]
+        # 1. Missing filter
+        null_ratios   = X.isnull().mean()
+        low_missing   = null_ratios[null_ratios <= self.missing_threshold].index
+        X_f           = X[low_missing]
 
-        # 3. Correlation Filter (Only for Numeric columns)
-        numeric_X = X_filtered.select_dtypes(include='number')
-        if y is not None and not numeric_X.empty:
-            temp_df = numeric_X.copy()
-            temp_df['target'] = y
-            correlations = temp_df.corr()['target'].abs().drop('target')
-            numeric_to_keep = correlations[correlations >= self.corr_threshold].index.tolist()
+        # 2. High-cardinality filter (categorical only)
+        cat_cols      = X_f.select_dtypes(exclude='number').columns
+        drop_cat      = [c for c in cat_cols
+                         if X_f[c].nunique() / len(X_f) > self.cardinality_threshold]
+        remaining_cats = [c for c in cat_cols if c not in drop_cat]
+
+        # 3. Correlation filter (numeric only)
+        num_X = X_f.select_dtypes(include='number')
+        if y is not None and not num_X.empty:
+            tmp  = num_X.copy()
+            tmp['__target__'] = y.values if hasattr(y, 'values') else y
+            corrs = tmp.corr()['__target__'].abs().drop('__target__')
+            numeric_keep = corrs[corrs >= self.corr_threshold].index.tolist()
         else:
-            numeric_to_keep = numeric_X.columns.tolist()
+            numeric_keep = num_X.columns.tolist()
 
-        self.features_to_keep = numeric_to_keep + remaining_cats
+        self.features_to_keep = numeric_keep + remaining_cats
         return self
 
     def transform(self, X):
         if not isinstance(X, pd.DataFrame):
             X = pd.DataFrame(X)
-        return X[self.features_to_keep]
-
-class FeatureEngineer(BaseEstimator, TransformerMixin):
-    
-    def __init__(self, windows=[5, 10, 20]):
-        """
-        Initialize with a list of windows. 
-        Example: FeatureEngineer(windows=[5, 14, 30])
-        """
-        self.windows = windows
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        # Handle input types
-        if isinstance(X, np.ndarray):
-            X_df = pd.DataFrame(X)
-        else:
-            X_df = X.copy()
-
-        # Ensure we are working with a Series for rolling/diff operations
-        # squeeze() is used if X_df is a single-column DataFrame
-        data = X_df.squeeze()
-        X_out = pd.DataFrame(index=X_df.index)
-        
-        # Iterate through each window to create multi-scale features
-        for w in self.windows:
-            
-            # 1. Exponential Moving Average
-            X_out[f'EMA_{w}'] = data.ewm(span=w, min_periods=w).mean()
-
-            # 2. Rate of Change
-            M = data.diff(w - 1)
-            N = data.shift(w - 1)
-            X_out[f'ROC_{w}'] = (M / N) * 100
-
-            # 3. Price Momentum
-            X_out[f'MOM_{w}'] = data.diff(w)
-
-            # 4. Relative Strength Index (RSI)
-            delta = data.diff()
-            u = pd.Series(np.where(delta > 0, delta, 0), index=delta.index)
-            d = pd.Series(np.where(delta < 0, -delta, 0), index=delta.index)
-            avg_gain = u.ewm(com=w - 1, adjust=False).mean()
-            avg_loss = d.ewm(com=w - 1, adjust=False).mean()
-            rs = avg_gain / avg_loss
-            X_out[f'RSI_{w}'] = 100 - (100 / (1 + rs))
-            
-            # 5. Simple Moving Average
-            X_out[f'MA_{w}'] = data.rolling(w, min_periods=w).mean()
-
-        return X_out
-
-class PairFeatureEngineer(BaseEstimator, TransformerMixin):
-    def __init__(self, window=60):
-        self.window = window
-        # Internal state
-        self.last_beta_ = None
-        self.last_alpha_ = None
-        self.is_fitted_ = False
-
-    def fit(self, X, y=None):
-        """
-        Validates that the input data is sufficient for the window size.
-        In scikit-learn, fit must always return self.
-        """
-        if len(X) < self.window:
-            raise ValueError(f"Data length {len(X)} is less than window size {self.window}")
-        
-        self.is_fitted_ = True
-        return self
-
-    def transform(self, X):
-        """
-        X: Expected to be a DataFrame or Array with 2 columns: [Price_A, Price_B]
-        """
-        if not self.is_fitted_:
-            raise RuntimeError("Extractor must be fitted before calling transform.")
-
-        # Convert to DataFrame if input is a numpy array
-        if isinstance(X, np.ndarray):
-            df = pd.DataFrame(X, columns=['price_a', 'price_b'])
-        else:
-            df = X.copy()
-            df.columns = ['price_a', 'price_b']
-        
-        # 1. Compute Rolling Spread and Beta
-        df[['spread', 'beta']] = self._compute_rolling_regression(df)
-
-        # 2. Derive Statistics-based Features
-        df['z_score'] = self._calculate_z_score(df['spread'])
-        df['spread_std'] = df['spread'].rolling(self.window).std()
-        df['beta_stability'] = df['beta'].rolling(self.window).std()
-
-        
-        return df#.dropna()
-
-    def _compute_rolling_regression(self, df):
-        spreads = np.full(len(df), np.nan)
-        betas = np.full(len(df), np.nan)
-        
-        a_vals = df['price_a'].values
-        b_vals = df['price_b'].values
-
-        for i in range(self.window, len(df)):
-            y = a_vals[i-self.window:i]
-            x = b_vals[i-self.window:i]
-            x_with_const = sm.add_constant(x)
-            
-            model = sm.OLS(y, x_with_const).fit()
-            
-            alpha, beta = model.params[0], model.params[1]
-            betas[i] = beta
-            spreads[i] = a_vals[i] - (beta * b_vals[i] + alpha)
-            
-            # Update state for live prediction tracking
-            self.last_alpha_, self.last_beta_ = alpha, beta
-            
-        return pd.DataFrame({'spread': spreads, 'beta': betas}, index=df.index)
-
-    def _calculate_z_score(self, spread_series):
-        rolling_mean = spread_series.rolling(self.window).mean()
-        rolling_std = spread_series.rolling(self.window).std()
-        return (spread_series - rolling_mean) / rolling_std
-
-# --- Usage Example ---
-# extractor = PairFeatureExtractor(window=60)
-# features_df = extractor.transform(data['AAPL'], data['MSFT'])
+        keep = [c for c in self.features_to_keep if c in X.columns]
+        return X[keep]
+       
