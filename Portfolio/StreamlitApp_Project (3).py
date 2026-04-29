@@ -45,7 +45,7 @@ from src.Custom_Classes import (
 )
 
 # Reference dataset saved during notebook training
-file_path = os.path.join(current_dir, 'Portfolio/X_train.csv')
+file_path = os.path.join(current_dir, 'X_train.csv')
 dataset   = pd.read_csv(file_path)
 dataset   = dataset.drop(columns=[c for c in dataset.columns
                                    if c.startswith('Unnamed')], errors='ignore')
